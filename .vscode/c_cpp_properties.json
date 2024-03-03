@@ -1,7 +1,7 @@
 {
     "env": {
         "myIncludePath": [
-            "~/lib/usr/local/include"
+            "./"
         ],
         "myDefines": [
             "DEBUG",
@@ -18,6 +18,7 @@
             "intelliSenseMode": "linux-gcc-x86",
             "includePath": [
                 "${myIncludePath}",
+                "./wsServer/include/",
                 "/usr/include",
                 "/usr/include/x86_64-linux-gnu"
             ],

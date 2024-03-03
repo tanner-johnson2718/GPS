@@ -1,50 +1,46 @@
-// * Use GSL for all data types and math operations
-// * All vector data types will be a gsl matrix
-// * All (non-trivial) functions return an error type
-// * Based on book GPS Theory, Algorithms, and applications
+// * Math Based on book GPS Theory, Algorithms, and applications
+// * leaflet mapping JS front end
+// * wsServer C websocket library as communication
+// * Use int32_t / uint16_t where appropriate
+// * Use LOG instead of printf
+// * Nontrivial functions shall return bool indicating success / failures.
+//     * On failure nontrivial functions shall log error details
+// * in ws.h change max clients to 1
 
 #include <stdio.h>
-#include <gsl/gsl_matrix.h>
-#include <gsl/gsl_math.h>
-#include <gsl/gsl_roots.h>
+#include <stdlib.h>
+#include <string.h>
 #include <math.h>
+#include <stdarg.h>
+#include <time.h>
+#include <ws.h>
+#include <time.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <unistd.h>
+
+#define ASYNC_TEST 0
+#define GEOCORD_TEST 0
+
 
 //*****************************************************************************
 // Util
 //*****************************************************************************
 
-#define SPATIAL_DIM 3
-#define LAT_MIN -M_PI_2
-#define LAT_MAX M_PI_2
-#define LON_MIN -M_PI
-#define LON_MAX M_PI
-#define A_EARTH_METERS 6378137.0
-#define B_EARTH_METERS 6356752.0
-#define E_EARTH 0.08181979099
-#define TAN_EPS .0001
-#define ITERATIVE_EPS .00000001
-#define ITERATIVE_MAX_ITERS 1000
+#define LOG(tag, format, ...) _log(tag, __LINE__, __func__, format, ##__VA_ARGS__)
 
-typedef enum
+static void _log(char* tag, int line_no, const char* func, char* format, ...)
 {
-    OK,
-    INVALID_DIM,
-    ITERATIVE_SOLN_FAILED
-} err_t;
+    time_t now;
+    time(&now);
+    va_list args;
+    va_start(args, format);
 
-static err_t print_matrix(gsl_matrix* m)
-{
-    size_t i, j;
-    for(i = 0; i < m->size1; ++i)
-    {
-        for(j = 0; j < m->size2; ++j)
-        {
-            printf("%0.4f ", gsl_matrix_get(m, i, j));
-        }
-        printf("\n");
-    }
+    printf("[ %5s ][ %20s:%04d ] ", tag, func, line_no);
+    vprintf(format, args);
+    printf("\n");
 
-    return OK;
+    va_end(args);
 }
 
 //*****************************************************************************
@@ -53,10 +49,6 @@ static err_t print_matrix(gsl_matrix* m)
 // axis extends through the poles with North being pos and origin at center of 
 // earth. The X-plane is zero-ed at the Greenwhich median. Y is perdicualar
 // east ward. We map x,y,z to our gsl_mat indicies as such:
-//
-//    gsl_mat index 0 -> X
-//    gsl_mat index 1 -> Y
-//    gsl_mat index 2 -> Z
 //
 // Spherical. Since Eart is not a perfect sphere, we generally do no map
 // cartesian to sperical. As a prelude to ellipsoidal cords, spherical 
@@ -162,203 +154,182 @@ static err_t print_matrix(gsl_matrix* m)
 //    5) N is distance between point {acos(theta), b sin(theta)} and y intercept
 //    6) Z is N - the portion of the normal verical below the y axis. 
 //
-// We use the following mapping between ellipsoidal cords and gsl mat indicies
-//
-//    gsl_mat index 0 -> h (height above ellipse)
-//    gsl_mat index 1 -> lamda or X/Y plane angle or longitutde
-//    gsl_mat index 2 -> theta or Angle made with the Z plane
+// As one can see going from ECEF -> WGS is much harder and requires numerics
+// or approximation. Included in the repo is a paper on the "improved Zhus"
+// algorithm for doing this fast and accurately. We will not go into depth
+// about it as it really isn't super important.
 //
 //*****************************************************************************
 
-static inline double N(double a, double e, double theta)
-{
-    return  a / sqrt(1.0 - (e*e*sin(theta) * sin(theta)));
-}
+static const double  a = +6.37813700000000000000e+0006; /* a */
+static const double  invaa = +2.45817225764733181057e-0014; /* 1/(a^2) */
+static const double  ee = +6.69437999014131705734e-0003; /* e^2 */
+static const double  l = +3.34718999507065852867e-0003; /* (e^2)/2 */
+static const double  ll4 = +4.48147234524044602618e-0005; /* e^4 */
+static const double  ll = +1.12036808631011150655e-0005; /* (e^4)/4 */
+static const double  p1mee = +9.93305620009858682943e-0001; /* 1-(e^2) */
+static const double  p1meedaa = +2.44171631847341700642e-0014; /* (1-(e^2))/(a^2) */
+static const double  Hmin = +2.25010182030430273673e-0014; /* (e^12)/4 */
+static const double  invcbrt2 = +7.93700525984099737380e-0001; /* 1/(2^(1/3)) */
+static const double  inv3 = +3.33333333333333333333e-0001; /* 1/3 */
+static const double  inv6 = +1.66666666666666666667e-0001; /* 1/6 */
+static const double  d2r = +1.74532925199432957691e-0002; /* pi/180 */
+static const double  r2d = +5.72957795130823208766e+0001; /* 180/pi */
 
-static inline double deg2rad(double d)
-{
-    return ((d * M_PI) / 180.0);
-}
-
-
-// in place conversion 
-static err_t ellipsodial2cartesian(gsl_matrix* m, double a, double e)
-{
-    if(m->size1 != SPATIAL_DIM || m->size2 != 1)
-    {
-        return INVALID_DIM;
-    }
-    
-    double h = gsl_matrix_get(m, 0,0);
-    double lambda = gsl_matrix_get(m, 1,0);
-    double theta = gsl_matrix_get(m, 2, 0);
-    
-
-    double _N = N(a, e, theta);
-    // printf("N = %0.4f\n", _N);
-
-    double x = (_N+h) * cos(theta) * cos(lambda);
-    double y = (_N+h) * cos(theta) * sin(lambda);
-    double z = ((_N*(1.0 - (e*e))) + h ) * sin(theta);
-
-    gsl_matrix_set(m, 0,0, x);
-    gsl_matrix_set(m, 1,0, y);
-    gsl_matrix_set(m, 2,0, z); 
- 
-    return OK;
-}
-
-// theta iteratice func s.t. roots are soln
 typedef struct
 {
-    double a;
-    double e;
-    double c0;
+    double x;
+    double y;
     double z;
-} theta_params_t;
-static double theta_roots(double theta, void* params)
-{
-    theta_params_t* p = (theta_params_t*) params; 
-    double a = p->a;
-    double e = p->e;
-    double c0 = p->c0;
-    double z = p->z;
-    double _N = N(a, e, theta);
+} ECEF_t;
 
-    return (z / (c0 - ((e*e)*_N*cos(theta)) )) - tan(theta);
+typedef struct
+{
+    double lat;
+    double lon;
+    double alt;
+} WGS84_t;
+
+
+static inline double N(double theta)
+{
+    return  a / sqrt(1.0 - (ee*sin(theta) * sin(theta)));
 }
 
-// Requires solving iteratively as ellipsodial cordinates cannot be expressed
-// in a closed form soln of x,y,z.
-static err_t cartesian2ellipsodial(gsl_matrix* m, double a, double e)
+double rad(double deg)
 {
-    if(m->size1 != SPATIAL_DIM || m->size2 != 1)
-    {
-        return INVALID_DIM;
-    }
-    
-    double x = gsl_matrix_get(m,0,0);
-    double y = gsl_matrix_get(m,1,0);
-    double z = gsl_matrix_get(m,2,0);
-
-    double lambda;
-    double theta;
-    double h;
-
-    if(fabs(x) < TAN_EPS )
-    {
-        lambda = x;
-    }
-    else
-    {
-        lambda = atan2(y, x);
-    }
-
-    double c0 = sqrt( (x*x) + (y*y) );
-    theta_params_t p;
-    p.a = a;
-    p.c0 = c0;
-    p.e = e;
-    p.z = z;
-
-    const gsl_root_fsolver_type * T = gsl_root_fsolver_bisection;
-    gsl_root_fsolver * s = gsl_root_fsolver_alloc (T);
-    gsl_function F;
-    F.function = &theta_roots;
-    F.params = &p;
-    gsl_root_fsolver_set(s, &F, LAT_MIN, LAT_MAX);
-
-    int i = 0;
-    double prev;
-    double curr;
-
-    gsl_root_fsolver_iterate(s);
-    curr = gsl_root_fsolver_root(s);
-    ++i;
-    
-    for(i = 1; i < ITERATIVE_MAX_ITERS; ++i)
-    {
-        if(gsl_root_fsolver_iterate(s))
-        {
-            i = ITERATIVE_MAX_ITERS;
-            break;
-        }
-
-        prev = curr;
-        curr = gsl_root_fsolver_root(s);
-        // printf("Iter = %d   Curr = %0.4f   Delta = %0.4f\n", i, curr, fabs(prev-curr));
-
-        if(fabs(prev-curr) < ITERATIVE_EPS)
-        {
-            break;
-        }
-
-    }
-
-    gsl_root_fsolver_free(s);
-
-    if(i == ITERATIVE_MAX_ITERS)
-    {
-        printf("WARING!!\n");
-        return ITERATIVE_SOLN_FAILED;
-    }
-
-    theta = curr;
-    h = (c0 / cos(theta)) - N(a, e, theta);
-
-    gsl_matrix_set(m, 0,0, h);
-    gsl_matrix_set(m, 1, 0, lambda);
-    gsl_matrix_set(m, 2, 0, theta);
-    
-    return OK;
+    return deg * d2r;
 }
 
-//*****************************************************************************
-// Local Coordinate Transformation
-//*****************************************************************************
-
-//*****************************************************************************
-// Unit Tests
-//*****************************************************************************
-
-double l1_error(gsl_matrix* m1, gsl_matrix* m2)
+double deg(double rad)
 {
-    double e1 = fabs(gsl_matrix_get(m1, 0,0) - gsl_matrix_get(m2, 0,0));
-    double e2 = fabs(gsl_matrix_get(m1, 1,0) - gsl_matrix_get(m2, 1,0));
-    double e3 = fabs(gsl_matrix_get(m1, 2,0) - gsl_matrix_get(m2, 2,0));
-    return (e1 + e2 + e3);
+    return rad * r2d;
 }
 
-double test_l1_error(double h, double lon, double lat)
+ECEF_t ECEF(WGS84_t in)
 {
-    gsl_matrix* m1 = gsl_matrix_calloc(3,1);
-    gsl_matrix* m2 = gsl_matrix_calloc(3,1);
-    gsl_matrix_set(m1, 0, 0, h);
-    gsl_matrix_set(m1, 1, 0, deg2rad(lon));
-    gsl_matrix_set(m1, 2, 0, deg2rad(lat));
-    gsl_matrix_set(m2, 0, 0, h);
-    gsl_matrix_set(m2, 1, 0, deg2rad(lon));
-    gsl_matrix_set(m2, 2, 0, deg2rad(lat));
+    ECEF_t p;
+    double _N = N(in.lat);
 
-    ellipsodial2cartesian(m1, A_EARTH_METERS, E_EARTH);
-    cartesian2ellipsodial(m1, A_EARTH_METERS, E_EARTH);
-    
-    double error = l1_error(m1, m2);
-    gsl_matrix_free(m1);
-    gsl_matrix_free(m2); 
+    p.x = (_N+in.alt) * cos(in.lat) * cos(in.lon);
+    p.y = (_N+in.alt) * cos(in.lat) * sin(in.lon);
+    p.z = ((_N*(1.0 - (ee))) + in.alt ) * sin(in.lat);
 
-    return error;
+    return p;
 }
 
-void ellipsoid_test(char* prompt, double h, double lon, double lat)
+// Zhu's algorith (see docs in repo)
+WGS84_t WGS84(ECEF_t in)
 {
-    double e = test_l1_error(h,lon,lat);
-    printf("%-10s (%0.4f,%0.4f,%0.4f) |%0.4f|\n", prompt, h, lon, lat, e);
+    double x, y, z;
+    double lat, lon, alt;
+    // The variables below correspond to symbols used in the paper
+    // "Accurate Conversion of Earth-Centered, Earth-Fixed Coordinates
+    // to Geodetic Coordinates"
+    double beta;
+    double C;
+    double dFdt;
+    double dt;
+    double dw;
+    double dz;
+    double F;
+    double G;
+    double H;
+    double i;
+    double k;
+    double m;
+    double n;
+    double p;
+    double P;
+    double t;
+    double u;
+    double v;
+    double w;
+    // Intermediate variables
+    double j;
+    double ww; // w^2
+    double mpn; // m+n
+    double g;
+    double tt; // t^2
+    double ttt; // t^3
+    double tttt; // t^4
+    double zu; // z * u
+    double wv; // w * v
+    double invuv; // 1 / (u * v)
+    double da;
+    double t1, t2, t3, t4, t5, t6, t7;
+    x = in.x;
+    y = in.y;
+    z = in.z;
+    ww = x * x + y * y;
+    m = ww * invaa;
+    n = z * z * p1meedaa;
+    mpn = m + n;
+    p = inv6 * (mpn - ll4);
+    G = m * n * ll;
+    H = 2 * p * p * p + G;
+    if (H < Hmin)
+    {
+    return (WGS84_t) {0,0,0};
+    }
+    C = pow(H + G + 2 * sqrt(H * G), inv3) * invcbrt2;
+    i = -ll - 0.5 * mpn;
+    P = p * p;
+    beta = inv3 * i - C - P / C;
+    k = ll * (ll - mpn);
+    // Compute left part of t
+    t1 = beta * beta - k;
+    t2 = sqrt(t1);
+    t3 = t2 - 0.5 * (beta + i);
+    t4 = sqrt(t3);
+    // Compute right part of t
+    t5 = 0.5 * (beta - i);
+    // t5 may accidentally drop just below zero due to numeric turbulence
+    // This only occurs at latitudes close to +- 45.3 degrees
+    t5 = fabs(t5);
+    t6 = sqrt(t5);
+    t7 = (m < n) ? t6 : -t6;
+    // Add left and right parts
+    t = t4 + t7;
+    // Use Newton-Raphson's method to compute t correction
+    j = l * (m - n);
+    g = 2 * j;
+    tt = t * t;
+    ttt = tt * t;
+    tttt = tt * tt;
+    F = tttt + 2 * i * tt + g * t + k;
+    dFdt = 4 * ttt + 4 * i * t + g;
+    dt = -F / dFdt;
+    // compute latitude (range -PI/2..PI/2)
+    u = t + dt + l;
+    v = t + dt - l;
+    w = sqrt(ww);
+    zu = z * u;
+    wv = w * v;
+    lat = atan2(zu, wv);
+    // compute altitude
+    invuv = 1 / (u * v);
+    dw = w - wv * invuv;
+    dz = z - zu * p1mee * invuv;
+    da = sqrt(dw * dw + dz * dz);
+    alt = (u < 1) ? -da : da;
+    // compute longitude (range -PI..PI)
+    lon = atan2(y, x);
+    return (WGS84_t) {lat, lon, alt};
 }
 
-int main(int argc, char** argv)
+#if GEOCORD_TEST
+
+static void ellipsoid_test(char* prompt, double h, double lon, double lat)
 {
-    ellipsoid_test("Nominal", 2041.5504, deg2rad(-104.80121891303988), deg2rad(38.996328766277756));
+    WGS84_t w1 = {lat, lon, h};
+    WGS84_t w2 = WGS84(ECEF(w1));
+    printf("%-10s W1 = (%012.4f,%012.4f,%012.4f) W2=(%012.4f,%012.4f,%012.4f)\n", prompt, w1.lat, w1.lon, w1.alt, w2.lat, w2.lon, w2.alt);
+}
+
+static void run_ellipsoid_test()
+{
+    ellipsoid_test("Nominal", 2041.5504, rad(-104.80121891303988), rad(38.996328766277756));
     ellipsoid_test("Median 0", 1220, 0, M_PI/4.0);
     ellipsoid_test("Median 1", 1440, 0, 0);
     ellipsoid_test("Neg h", -100, M_PI/2.0, M_PI/4.0);
@@ -373,5 +344,478 @@ int main(int argc, char** argv)
     ellipsoid_test("Large h", 20200000, 0,M_PI/2.0);
     ellipsoid_test("Large h", 20200000, 0,-M_PI/2.0);
     ellipsoid_test("Large h", 20200000, M_PI,M_PI/2.0);
+}
+
+#endif
+
+//*****************************************************************************
+// Path Generator. All points in ECEF
+//*****************************************************************************
+
+typedef struct
+{
+    ECEF_t p;      // Pos (m)
+    ECEF_t v;      // Vel (m/s)
+    ECEF_t a;      // Acc (m/s2)
+    double  t;     // Time in simulation (sec).(ns)
+} PATH_t;
+
+// We assume path[0] and path[n-1] has valid data giving ini and fini cond.
+// returns success or not.
+bool path_gen(PATH_t* path, int n)
+{
+    if(path[0].t >= path[n-1].t )
+    {
+        LOG("ERRORR", "In path_gen end point has timestamp before start point");
+        return false;
+    }
+
+    if(n < 2)
+    {
+        LOG("ERRORR", "In path_gen must have a start and end data point in passed points");
+        return false;
+    }
+
+    PATH_t delta;
+    delta.t = (path[n-1].t - path[0].t) / (double) n;
+    delta.p = (ECEF_t) {
+        (path[n-1].p.x - path[0].p.x) / (double) n,
+        (path[n-1].p.y - path[0].p.y) / (double) n,
+        (path[n-1].p.z - path[0].p.z) / (double) n
+    };
+
+    delta.v = (ECEF_t) {
+        delta.p.x / delta.t,
+        delta.p.y / delta.t,
+        delta.p.z / delta.t
+    };
+
+    delta.a = (ECEF_t) {0.0,0.0,0.0};
+
+    // Overwrite init cond v and a
+    path[0].v = delta.v;
+    path[0].a = delta.a;
+    path[n-1].v = delta.v;
+    path[n-1].a = delta.a;
+
+    int i;
+    for(i = 1; i < n-1; ++i)
+    {
+        path[i].v = delta.v;
+        path[i].a = delta.a;
+
+        path[i].p.x = path[0].p.x + ((delta.p.x) * i);
+        path[i].p.y = path[0].p.y + ((delta.p.y) * i);
+        path[i].p.z = path[0].p.z + ((delta.p.z) * i);
+    }
+
+    return 0;
+
+}
+
+//*****************************************************************************
+// Async Queue / Runners. Primitives:
+//    * Q - This is the base data structure. Currently operates as a stack
+//          with controled access. Posters must wait the poster cv if the q is
+//          full. This cv is signaled when a comsumer or getter pops an
+//          element off the queue. Elements of the queue are of the same length
+//          and *should* be of the same type. Access to the queue both post
+//          and get only happens atomically with the lock held.
+//
+//    * Post - Copies an element from the passed buffer on the queue. If full
+//             wait for poster cv signal. On completion signal the getter cv.
+//             Is reentrant i.e. can have multiple threads posting at the same
+//             time
+//
+//    * Get - Copies an element form the head of the queue to the passed buffer
+//            When empty will block until it recieves a getter cv signal. Upon
+//            successful get, will signal the poster cv. Is reentrant.
+//
+//    * Runners - 
+//*****************************************************************************
+
+typedef struct
+{
+    pthread_cond_t poster_cv;
+    pthread_cond_t getter_cv;
+    pthread_mutex_t lock;
+    uint32_t element_size;
+    uint32_t n_max;
+    uint32_t n;
+    void* q;
+} async_q_t;
+
+typedef void (*async_consumer_t)(void*);
+
+typedef struct
+{
+    pthread_t pthread;
+    uint32_t thread_num;
+    uint16_t n_runners;
+    async_q_t* q;
+    async_consumer_t consume;
+    bool killed;
+} async_runner_t;
+
+
+
+static bool async_q_create(async_q_t* q, uint32_t element_size, uint32_t n_elements)
+{
+    q->poster_cv = (pthread_cond_t) PTHREAD_COND_INITIALIZER;
+    q->getter_cv = (pthread_cond_t) PTHREAD_COND_INITIALIZER;
+    q->lock = (pthread_mutex_t) PTHREAD_MUTEX_INITIALIZER;
+    q->element_size = element_size;
+    q->n_max = n_elements;  
+    q->n = 0;
+    q->q = calloc(element_size, n_elements);
+    if(!(q->q))
+    {
+        LOG("ERROR", "In async_q_create calloc failure");
+        return false;
+    }
+
+    return true;
+}
+
+// Unsafe. Make sure all threads waiting on the queue are joined and killed
+static bool aysnc_q_destroy(async_q_t* q)
+{
+    bool ret = true;
+    if(pthread_mutex_destroy(&(q->lock)))
+    {
+        LOG("ERROR", "In async_q_destroy failed to destroy lock");
+        ret = false;
+    }
+
+    if(pthread_cond_destroy(&(q->poster_cv)))
+    {
+        LOG("ERROR", "In async_q_destroy failed to destroy cv");
+        ret = false;
+    }
+
+    if(pthread_cond_destroy(&(q->getter_cv)))
+    {
+        LOG("ERROR", "In async_q_destroy failed to destroy cv");
+        ret = false;
+    }
+
+    free(q->q);
+
+    return ret;
+}
+
+static bool async_post(async_q_t* q, void* elem)
+{
+    bool ret = true;
+    if(pthread_mutex_lock(&(q->lock)))
+    {
+        LOG("ERROR", "In async_post mutex lock failed");
+        return false;
+    }
+
+    while(q->n == q->n_max)
+    {
+        if(pthread_cond_wait(&(q->poster_cv), &(q->lock)))
+        {
+            LOG("ERROR", "In async_post cond wait failed");
+        }
+    }
+
+    memcpy(q->q + ((q->n)* (q->element_size)), elem, q->element_size);
+    ++(q->n);
+    if(pthread_cond_signal(&(q->getter_cv)))
+    {
+        LOG("ERROR", "In async_post cond signal failed");
+        ret = false;
+    }
+
+
+    if(pthread_mutex_unlock(&(q->lock)))
+    {
+        LOG("ERROR", "In async_post mutex unlock failed");
+        ret = false;
+    }
+
+    return ret;
+    
+}
+
+// blocking
+static bool async_get(async_q_t* q, void* elem)
+{
+    bool ret = true;
+    if(pthread_mutex_lock(&(q->lock)))
+    {
+        LOG("ERROR", "In async_get mutex lock failed");
+        return false;
+    }
+
+    while(q->n == 0)
+    {
+        if(pthread_cond_wait(&(q->getter_cv), &(q->lock)))
+        {
+            LOG("ERROR", "In async_get cond wait failed");
+        }
+    }
+
+    memcpy(elem, q->q + (((q->n)-1)* (q->element_size)), q->element_size);
+    --(q->n);
+
+    if(pthread_cond_signal(&(q->poster_cv)))
+    {
+        LOG("ERROR", "In async_get cond signal failed");
+        ret = false;
+    }
+
+    if(pthread_mutex_unlock(&(q->lock)))
+    {
+        LOG("ERROR", "In async_get mutex unlock failed");
+        ret = false;
+    }
+
+    return ret;
+
+}
+
+static void* _async_thread_func(void* args)
+{
+    async_runner_t* me = (async_runner_t*) args;
+    uint8_t elem[me->q->element_size];
+
+    LOG("INFO", "Async Runner %d starting", me->thread_num);
+
+    while(!(me->killed))
+    {
+        if(!async_get(me->q, (void*) &elem))
+        {
+            LOG("ERROR", "In async_runner %d async_get failed");
+        }
+
+        if(me->killed)
+        {
+            break;
+        }
+
+        me->consume((void*) &elem);
+    }
+
+    LOG("INFO", "Async Runner %d killed", me->thread_num);
+    return NULL;
+}
+
+
+static bool async_launch_runners(async_runner_t* runners, 
+                          uint16_t n_runners,
+                          async_q_t* alloced_queue,
+                          async_consumer_t consumer_func)
+{
+
+    if(n_runners >= alloced_queue->n_max)
+    {
+        LOG("ERROR", "In async_launch_runners we do not allow there to be more runners than the size of the queue");
+        return false;
+    }
+
+    uint16_t i;
+    for(i = 0; i < n_runners; ++i)
+    {
+        async_runner_t* runner = &(runners[i]) ;
+
+        runner->thread_num = i;
+        runner->consume = consumer_func;
+        runner->q = alloced_queue;
+        runner->killed = false;
+        runner->n_runners = n_runners;
+
+        if( pthread_create(&(runner->pthread), 
+                       NULL, 
+                       _async_thread_func,
+                       (void*) runner)
+        )
+        {
+            LOG("ERROR", "In async_launch_runners pthread create failed");
+            return false;
+        }
+    }
+
+    return true;
+
+}
+
+static bool async_kill_runners(async_runner_t* runners)
+{
+    uint16_t i;
+    uint16_t n_runners = runners[0].n_runners;
+    bool ret = true;
+
+    for(i = 0; i < n_runners; ++i)
+    {
+        runners[i].killed = true;
+    }
+
+    for(i = 0; i < n_runners; ++i)
+    {
+        uint8_t elem[runners[i].q->element_size];
+        if(!async_post((runners[i].q), elem))
+        {
+            LOG("ERROR", "In async_kill_runners Failed to post");
+            ret = false;
+        }
+    }
+
+    for(i = 0; i < n_runners; ++i)
+    {
+        if(pthread_join((runners[i].pthread), NULL))
+        {
+            LOG("ERROR", "In async_kill_runners Failed to join");
+            ret = false;
+        }
+    }
+
+    return ret;
+
+}
+
+#if ASYNC_TEST
+
+static bool check_off[1000] = {0};
+
+static void consumer(void* args)
+{
+    int arg = *((int*) args);
+
+    if(check_off[arg])
+    {
+        LOG("ERROR", "TEST FAILED - duplicate elements: %d", arg);
+    }
+    else
+    {
+        check_off[arg] = true;
+    }
+}
+
+static void async_q_test()
+{
+    uint16_t n_runners = 3;
+    uint32_t n_elem = 10;
+    async_q_t q;
+    async_runner_t runners[n_runners];
+    uint32_t i;
+
+    async_q_create(&q, sizeof(int), n_elem);
+    async_launch_runners(runners, n_runners, &q, consumer);
+
+    for(i = 0; i < 1000; ++i)
+    {
+        async_post(&q, (void*) (&i));
+    }
+
+    sleep(1);
+
+
+    for(i = 0; i < 1000; ++i)
+    {
+        if(check_off == false)
+        {
+            LOG("ERROR", "TEST FAILED - elem not consumed");
+            break;
+        }
+    }
+
+    LOG("INFO", "TEST PASSED");
+
+    async_kill_runners(runners);
+    aysnc_q_destroy(&q);
+
+}
+
+#endif
+
+//*****************************************************************************
+// Web Socket interface. 
+//*****************************************************************************
+
+static ws_cli_conn_t *ui_client = NULL; 
+
+void onopen(ws_cli_conn_t *client)
+{
+	char *cli, *port;
+	cli  = ws_getaddress(client);
+	port = ws_getport(client);
+	LOG("INFO", "WS Connection opened, addr: %s, port: %s", cli, port);
+
+    if(ui_client == NULL)
+    {
+        ui_client = client;
+    }
+    else
+    {
+        // Set max clients to 1 in ws.h. Should not get here
+        LOG("ERROR", "Received multiple clients trying to connect");
+    }
+}
+
+void onclose(ws_cli_conn_t *client)
+{
+	char *cli, *port;
+	cli = ws_getaddress(client);
+    port = ws_getport(client);
+	LOG("INFO", "WS Connection closed, addr: %s, port: %s", cli, port);
+}
+
+void onmessage(ws_cli_conn_t *client,
+	const unsigned char *msg, uint64_t size, int type)
+{
+	char *cli, *port;
+	cli = ws_getaddress(client);
+    port = ws_getport(client);
+	LOG("INFO", "I receive a message: %s (size: %" PRId64 ", type: %d), from: %s:%s",
+		msg, size, type, cli, port);
+}
+
+
+
+//*****************************************************************************
+// Entry
+//*****************************************************************************
+
+int main(void)
+{
+
+    ws_socket(&(struct ws_server){
+		.host = "127.0.0.1",
+		.port = 6969,
+		.thread_loop   = 0,
+		.timeout_ms    = 1000,
+		.evs.onopen    = &onopen,
+		.evs.onclose   = &onclose,
+		.evs.onmessage = &onmessage
+	});
+
+    PATH_t path[10];
+    path[0].p = ECEF((WGS84_t) {rad(38.0), rad(-105.0), 2000});
+    path[0].v = (ECEF_t) {0,0,0};
+    path[0].a = (ECEF_t) {0,0,0};
+    path[0].t = 0.0;
+
+    path[9].p = ECEF((WGS84_t) {rad(38.0), rad(-115.0), 2000});
+    path[9].v = (ECEF_t) {0,0,0};
+    path[9].a = (ECEF_t) {0,0,0};
+    path[9].t = 10.0;
+
+    path_gen(path, 10);
+    char send_str[100];
+
+    int i;
+    for(i = 0; i < 10; i++)
+    {
+        WGS84_t w = WGS84(path[i].p);
+        snprintf(send_str, 100, "%15lf,%15lf", deg(w.lat), deg(w.lon));
+        LOG("INFO", "Sending: %s", send_str);
+        ws_sendframe_txt(ui_client, send_str);
+        sleep(1);
+        
+    }
+    
     return 0;
 }

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<base target="_top">
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	
+	<title> Where? </title>
+	
+	<link rel="shortcut icon" type="image/x-icon" href="images/favicon.ico" />
+
+    <link rel="stylesheet" href="./leaflet.css"/>
+    <script src="./leaflet.js"></script>
+
+	<style>
+		html, body {
+			height: 100%;
+			margin: 50;
+		}
+		.leaflet-container {
+			height: 400px;
+			width: 600px;
+			max-width: 100%;
+			max-height: 100%;
+		}
+	</style>
+	
+</head>
+<body>
+<div id="map" style="width: 600px; height: 400px;"></div>
+<script>
+	const LAT_INIT = 38.0;
+	const LON_INIT = -105.0;
+	const default_zoom = 5;
+	const host = "127.0.0.1";
+	const port = 6969;
+	const base_layer = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+	const attriburtion = '&copy; <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a>';
+	const map = L.map('map').setView([LAT_INIT, LON_INIT], default_zoom);
+	const tiles = L.tileLayer(base_layer, { maxZoom: 19, attribution: attriburtion });
+
+	var path = L.polyline([], {color: "red"});
+
+
+	function onPressLatLon(event) {
+		if(event.key == "Enter") {
+			var lat = document.getElementsByName("lat")[0].value;
+			var lon = document.getElementsByName("lon")[0].value;
+			map.setView([lat, lon], default_zoom, true);9
+		}
+	}
+
+	function handleWSInput(event){
+		console.log(event);
+	}
+
+	function connectWS() {
+		try {
+			const socket = new WebSocket("ws://127.0.0.1:6969");
+
+			socket.addEventListener("open", (event) => {
+	  			console.log(event);
+			});
+
+			socket.addEventListener("message", handleWSInput);
+		}
+		catch (error){
+			console.error(error);
+		}
+	}
+
+	connectWS();
+	tiles.addTo(map);
+</script>
+</div>
+
+
+<label for="lat"> Lat:  </label>
+<input type ="text" 
+       name="lat" 
+	   required minlength="3" 
+	   maxlength="13" 
+	   size="16" 
+	   onkeypress="onPressLatLon(event)"
+/>
+<label for="lon"> Lon: </label>
+<input type ="text" 
+       name="lon" 
+	   required minlength="3" 
+	   maxlength="13" 
+	   size="16" 
+	   onkeypress="onPressLatLon(event)"
+/>
+
+</body>
+</html>
