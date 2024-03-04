@@ -13,11 +13,13 @@
 #include <math.h>
 #include <stdarg.h>
 #include <time.h>
-#include <ws.h>
 #include <time.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <unistd.h>
+
+#define MAX_CLIENTS 1
+#include "ws.h"
 
 #define ASYNC_TEST 0
 #define GEOCORD_TEST 0
@@ -366,13 +368,13 @@ bool path_gen(PATH_t* path, int n)
 {
     if(path[0].t >= path[n-1].t )
     {
-        LOG("ERRORR", "In path_gen end point has timestamp before start point");
+        LOG("ERROR", "In path_gen end point has timestamp before start point");
         return false;
     }
 
     if(n < 2)
     {
-        LOG("ERRORR", "In path_gen must have a start and end data point in passed points");
+        LOG("ERROR", "In path_gen must have a start and end data point in passed points");
         return false;
     }
 
@@ -735,7 +737,42 @@ static void async_q_test()
 // Web Socket interface. 
 //*****************************************************************************
 
-static ws_cli_conn_t *ui_client = NULL; 
+static uint32_t path_q_size = 100;
+static ws_cli_conn_t *ui_client = NULL;
+static async_runner_t path_runner;
+static async_q_t path_q;
+
+void consome_path(void* arg)
+{
+    WGS84_t point = *((WGS84_t*) arg);
+    char send_str[48];
+    snprintf(send_str, 100, "%15lf,%15lf", deg(point.lat), deg(point.lon));
+    LOG("INFO", "Sending: %s", send_str);
+    ws_sendframe_txt(ui_client, send_str);
+}
+
+void post_path()
+{
+    PATH_t path[10];
+    path[0].p = ECEF((WGS84_t) {rad(38.0), rad(-105.0), 2000});
+    path[0].v = (ECEF_t) {0,0,0};
+    path[0].a = (ECEF_t) {0,0,0};
+    path[0].t = 0.0;
+    path[9].p = ECEF((WGS84_t) {rad(38.0), rad(-115.0), 2000});
+    path[9].v = (ECEF_t) {0,0,0};
+    path[9].a = (ECEF_t) {0,0,0};
+    path[9].t = 10.0;
+    path_gen(path, 10);
+
+    int i;
+    for(i = 0; i < 10; i++)
+    {
+        WGS84_t w = WGS84(path[i].p);
+        async_post(&path_q, &w);
+        sleep(1);
+    }
+    
+}
 
 void onopen(ws_cli_conn_t *client)
 {
@@ -744,15 +781,25 @@ void onopen(ws_cli_conn_t *client)
 	port = ws_getport(client);
 	LOG("INFO", "WS Connection opened, addr: %s, port: %s", cli, port);
 
-    if(ui_client == NULL)
+    if(ui_client != NULL)
     {
-        ui_client = client;
+        LOG("WARN", "Multiple clients connected .. closing duplicate client socket");
+        ws_close_client(client);
     }
-    else
-    {
-        // Set max clients to 1 in ws.h. Should not get here
-        LOG("ERROR", "Received multiple clients trying to connect");
-    }
+    ui_client = client;
+
+
+    async_q_create(&path_q, sizeof(WGS84_t), path_q_size);
+    async_launch_runners(&path_runner, 1, &path_q, consome_path);
+
+    post_path();
+
+    async_kill_runners(&path_runner);
+    aysnc_q_destroy(&path_q);
+
+    ws_close_client(client);
+    ui_client = NULL;
+
 }
 
 void onclose(ws_cli_conn_t *client)
@@ -774,7 +821,6 @@ void onmessage(ws_cli_conn_t *client,
 }
 
 
-
 //*****************************************************************************
 // Entry
 //*****************************************************************************
@@ -792,30 +838,7 @@ int main(void)
 		.evs.onmessage = &onmessage
 	});
 
-    PATH_t path[10];
-    path[0].p = ECEF((WGS84_t) {rad(38.0), rad(-105.0), 2000});
-    path[0].v = (ECEF_t) {0,0,0};
-    path[0].a = (ECEF_t) {0,0,0};
-    path[0].t = 0.0;
-
-    path[9].p = ECEF((WGS84_t) {rad(38.0), rad(-115.0), 2000});
-    path[9].v = (ECEF_t) {0,0,0};
-    path[9].a = (ECEF_t) {0,0,0};
-    path[9].t = 10.0;
-
-    path_gen(path, 10);
-    char send_str[100];
-
-    int i;
-    for(i = 0; i < 10; i++)
-    {
-        WGS84_t w = WGS84(path[i].p);
-        snprintf(send_str, 100, "%15lf,%15lf", deg(w.lat), deg(w.lon));
-        LOG("INFO", "Sending: %s", send_str);
-        ws_sendframe_txt(ui_client, send_str);
-        sleep(1);
-        
-    }
+    // Does not return gets replace with the listening thread
     
     return 0;
 }

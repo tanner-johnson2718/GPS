@@ -13,21 +13,19 @@
     <script src="./leaflet.js"></script>
 
 	<style>
-		html, body {
-			height: 100%;
-			margin: 50;
-		}
-		.leaflet-container {
-			height: 400px;
-			width: 600px;
-			max-width: 100%;
-			max-height: 100%;
-		}
+		body {
+            padding: 0;
+            margin: 0;
+        }
+        html, body, #map {
+            height: 100%;
+            width: 100%;
+        }
 	</style>
 	
 </head>
 <body>
-<div id="map" style="width: 600px; height: 400px;"></div>
+<div id="map"></div>
 <script>
 	const LAT_INIT = 38.0;
 	const LON_INIT = -105.0;
@@ -36,22 +34,34 @@
 	const port = 6969;
 	const base_layer = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
 	const attriburtion = '&copy; <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a>';
-	const map = L.map('map').setView([LAT_INIT, LON_INIT], default_zoom);
-	const tiles = L.tileLayer(base_layer, { maxZoom: 19, attribution: attriburtion });
+	
+	var tiles = L.tileLayer(base_layer, { maxZoom: 19, attribution: attriburtion });
+	var map = L.map('map', {
+		center: [LAT_INIT, LON_INIT],
+		zoom: default_zoom,
+		layers: [tiles]
+	});
+
+	const baseLayers = {
+		'Base Map': tiles
+	};
+	const layerControl = L.control.layers(baseLayers).addTo(map);
 
 	var path = L.polyline([], {color: "red"});
-
 
 	function onPressLatLon(event) {
 		if(event.key == "Enter") {
 			var lat = document.getElementsByName("lat")[0].value;
 			var lon = document.getElementsByName("lon")[0].value;
-			map.setView([lat, lon], default_zoom, true);9
+			map.setView([lat, lon], default_zoom, true);
 		}
 	}
 
 	function handleWSInput(event){
-		console.log(event);
+		
+		tuple_str = event.data.split(",");
+		tuple_doubles = [Number(tuple_str[0]),Number(tuple_str[1])];
+		path.addLatLng(tuple_doubles);
 	}
 
 	function connectWS() {
@@ -59,6 +69,10 @@
 			const socket = new WebSocket("ws://127.0.0.1:6969");
 
 			socket.addEventListener("open", (event) => {
+	  			console.log(event);
+			});
+
+			socket.addEventListener("close", (event) => {
 	  			console.log(event);
 			});
 
@@ -70,27 +84,11 @@
 	}
 
 	connectWS();
-	tiles.addTo(map);
+
+	
+	path.addTo(map);
 </script>
 </div>
-
-
-<label for="lat"> Lat:  </label>
-<input type ="text" 
-       name="lat" 
-	   required minlength="3" 
-	   maxlength="13" 
-	   size="16" 
-	   onkeypress="onPressLatLon(event)"
-/>
-<label for="lon"> Lon: </label>
-<input type ="text" 
-       name="lon" 
-	   required minlength="3" 
-	   maxlength="13" 
-	   size="16" 
-	   onkeypress="onPressLatLon(event)"
-/>
 
 </body>
 </html>
