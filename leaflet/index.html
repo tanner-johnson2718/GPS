@@ -42,12 +42,16 @@
 		layers: [tiles]
 	});
 
+	var path = L.polyline([], {color: "red"});
+
 	const baseLayers = {
 		'Base Map': tiles
 	};
-	const layerControl = L.control.layers(baseLayers).addTo(map);
+	const overlays = {
+		'Sat 1' : path
+	}
 
-	var path = L.polyline([], {color: "red"});
+	const layerControl = L.control.layers(baseLayers, overlays).addTo(map);
 
 	function onPressLatLon(event) {
 		if(event.key == "Enter") {

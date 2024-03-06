@@ -17,13 +17,16 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <unistd.h>
-
-#define MAX_CLIENTS 1
 #include "ws.h"
 
 #define ASYNC_TEST 0
 #define GEOCORD_TEST 0
-
+#define WS_SERVER_IP "127.0.0.1"
+#define WS_SERVER_PORT 6969
+#define WS_RESPONSE_MSG_SIZE 128
+#define NUM_SVS 30
+#define MAX_SV_PATH_SIZE 32
+#define AVG_SV_HEIGHT 20200000
 
 //*****************************************************************************
 // Util
@@ -351,71 +354,6 @@ static void run_ellipsoid_test()
 #endif
 
 //*****************************************************************************
-// Path Generator. All points in ECEF
-//*****************************************************************************
-
-typedef struct
-{
-    ECEF_t p;      // Pos (m)
-    ECEF_t v;      // Vel (m/s)
-    ECEF_t a;      // Acc (m/s2)
-    double  t;     // Time in simulation (sec).(ns)
-} PATH_t;
-
-// We assume path[0] and path[n-1] has valid data giving ini and fini cond.
-// returns success or not.
-bool path_gen(PATH_t* path, int n)
-{
-    if(path[0].t >= path[n-1].t )
-    {
-        LOG("ERROR", "In path_gen end point has timestamp before start point");
-        return false;
-    }
-
-    if(n < 2)
-    {
-        LOG("ERROR", "In path_gen must have a start and end data point in passed points");
-        return false;
-    }
-
-    PATH_t delta;
-    delta.t = (path[n-1].t - path[0].t) / (double) n;
-    delta.p = (ECEF_t) {
-        (path[n-1].p.x - path[0].p.x) / (double) n,
-        (path[n-1].p.y - path[0].p.y) / (double) n,
-        (path[n-1].p.z - path[0].p.z) / (double) n
-    };
-
-    delta.v = (ECEF_t) {
-        delta.p.x / delta.t,
-        delta.p.y / delta.t,
-        delta.p.z / delta.t
-    };
-
-    delta.a = (ECEF_t) {0.0,0.0,0.0};
-
-    // Overwrite init cond v and a
-    path[0].v = delta.v;
-    path[0].a = delta.a;
-    path[n-1].v = delta.v;
-    path[n-1].a = delta.a;
-
-    int i;
-    for(i = 1; i < n-1; ++i)
-    {
-        path[i].v = delta.v;
-        path[i].a = delta.a;
-
-        path[i].p.x = path[0].p.x + ((delta.p.x) * i);
-        path[i].p.y = path[0].p.y + ((delta.p.y) * i);
-        path[i].p.z = path[0].p.z + ((delta.p.z) * i);
-    }
-
-    return 0;
-
-}
-
-//*****************************************************************************
 // Async Queue / Runners. Primitives:
 //    * Q - This is the base data structure. Currently operates as a stack
 //          with controled access. Posters must wait the poster cv if the q is
@@ -458,8 +396,6 @@ typedef struct
     async_consumer_t consume;
     bool killed;
 } async_runner_t;
-
-
 
 static bool async_q_create(async_q_t* q, uint32_t element_size, uint32_t n_elements)
 {
@@ -734,7 +670,245 @@ static void async_q_test()
 #endif
 
 //*****************************************************************************
-// Web Socket interface. 
+// SV Real time data and location prediction and regression. For each GPS sat
+// i.e. sv we keep only its most up to date location in WGS84 cordinates. We 
+// also keep its SV ID and a time for which that location was recorded in a 
+// floating value in UTC time.
+//
+// We provide two functions. 1) is the SV in some given bounds. This is so we
+// can determine which SVs we need to send the client data on. We also provide
+// generate path function which given an SV in some given bounds, we predict
+// and regress its location to the boundary and fill in a path buffer giving
+// its location at uniform time intervals while in the boundary. 
+//*****************************************************************************
+
+typedef struct
+{   uint16_t sv_id;
+    WGS84_t p;
+    WGS84_t v;
+    double  t;
+} PATH_t;
+
+static PATH_t sv_locs[NUM_SVS];
+
+static bool is_sv_on_map(uint16_t id, 
+                         double lat_min, 
+                         double lat_max,
+                         double lon_min,
+                         double lon_max)
+{
+    if(id >= NUM_SVS)
+    {
+        LOG("ERROR", "invalid id");
+        return false;
+    }
+
+    if(lat_min < -M_PI_2 || lat_max > M_PI_2 || lat_max <= lat_min)
+    {
+        LOG("ERROR", "lat range invalid");
+        return false;
+    }
+
+    if(lon_min < -M_PI || lon_max > M_PI || lon_max <= lon_min)
+    {
+        LOG("ERROR", "lon range invalid");
+        return false;
+    }
+
+    WGS84_t w = sv_locs[id].p;
+
+    if(w.lat < lat_min || w.lat > lat_max || w.lon < lon_min || w.lon > lon_max)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+
+
+bool generate_path(uint16_t id, 
+                   double lat_min, 
+                   double lat_max,
+                   double lon_min,
+                   double lon_max,
+                   PATH_t* path,
+                   uint16_t path_size)
+{
+    if(!is_sv_on_map(id, lat_min,lat_max,lon_min,lon_max) )
+    {
+        LOG("ERROR", "SV not on map");
+    }
+
+    if(path == NULL)
+    {
+        LOG("ERROR", "NULL path passed");
+        return false;
+    }
+
+    //*************************************************************************
+    // We compute the distance and time from the point to each boundary using 
+    // the lat and lon rates of change. The two closest boundary points are
+    // those whose time to reach them are closest to zero. This allows us to 
+    // compute the two points of the path on the boundary
+    //*************************************************************************
+
+    WGS84_t p = sv_locs[id].p;
+    WGS84_t v = sv_locs[id].v;
+    double lat_d_north = lat_max - p.lat;
+    double lat_d_south = lat_min - p.lat;
+    double lon_d_east = lon_max - p.lon;
+    double lon_d_west = lon_min - p.lon;
+
+    double lat_t_north;
+    double lat_t_south;
+    double lon_t_east;
+    double lon_t_west;
+
+    double smallest, next_smallest;
+
+    lat_t_north = ((v.lat == 0.0) ? INFINITY : (lat_d_north / v.lat));
+    lat_t_south = ((v.lat == 0.0) ? INFINITY : (lat_d_south / v.lat));
+    if(fabs(lat_t_north) < fabs(lat_t_south))
+    {
+        smallest = lat_t_north;
+        next_smallest = lat_d_south;
+    }
+    else
+    {
+        smallest = lat_t_south;
+        next_smallest = lat_t_north;
+    }
+
+    lon_t_east = ((v.lon == 0.0) ? INFINITY : (lon_d_east / v.lon));
+    if(fabs(lon_t_east) < fabs(smallest))
+    {
+        next_smallest = smallest;
+        smallest = lon_t_east;
+    }
+    else if(fabs(lon_t_east) < fabs(next_smallest))
+    {
+        next_smallest = lon_t_east;
+    }
+
+    lon_t_west = ((v.lon == 0.0) ? INFINITY : (lon_d_west / v.lon));
+    if(fabs(lon_t_east) < fabs(smallest))
+    {
+        next_smallest = smallest;
+        smallest = lon_t_east;
+    }
+    else if(fabs(lon_t_east) < fabs(next_smallest))
+    {
+        next_smallest = lon_t_east;
+    }
+
+    WGS84_t path_bd_first;
+    WGS84_t path_bd_second;
+
+    if(smallest == lat_t_north)
+    {
+        path_bd_first.lat = lat_max;
+        path_bd_first.lon = v.lon*lat_t_north;
+    }
+    else if(smallest == lat_t_south)
+    {
+        path_bd_first.lat = lat_min;
+        path_bd_first.lon = v.lon*lat_t_south;
+    }
+    else if(smallest == lon_t_east)
+    {
+        path_bd_first.lon = lon_max;
+        path_bd_first.lat = v.lat*lon_t_east;
+    }
+    else if(smallest == lon_t_west)
+    {
+        path_bd_first.lon = lon_min;
+        path_bd_first.lat = v.lat*lon_t_west;
+    }
+
+    if(next_smallest == lat_t_north)
+    {
+        path_bd_second.lat = lat_max;
+        path_bd_second.lon = v.lon*lat_t_north;
+    }
+    else if(next_smallest == lat_t_south)
+    {
+        path_bd_second.lat = lat_min;
+        path_bd_second.lon = v.lon*lat_t_south;
+    }
+    else if(next_smallest == lon_t_east)
+    {
+        path_bd_second.lon = lon_max;
+        path_bd_second.lat = v.lat*lon_t_east;
+    }
+    else if(next_smallest == lon_t_west)
+    {
+        path_bd_second.lon = lon_min;
+        path_bd_second.lat = v.lat*lon_t_west;
+    }
+
+    LOG("DEBUG", "");
+    LOG("DEBUG", "Path Boundaries for id=%d", id);
+    LOG("DEBUG", "lat_bd = [%0.2lf x %0.2lf]   lon_bd = [%0.2lf x %0.2lf]", lat_min, lat_max, lon_min, lon_max);
+    LOG("DEBUG", "P = [%0.2lf , %0.2lf]   V = [%0.2lf , %0.2lf]", p.lat, p.lon, v.lat, v.lon);
+    LOG("DEBUG", "lat_t_north = %0.2lf", lat_t_north);
+    LOG("DEBUG", "lat_t_south = %0.2lf", lat_t_south);
+    LOG("DEBUG", "lon_t_east = %0.2lf", lon_t_east);
+    LOG("DEBUG", "lon_t_west = %0.2lf", lon_t_west);
+    LOG("DEBUG", "");
+
+}
+
+// for now just put some random bs in there
+void pull_init_sv_locs()
+{
+    
+}
+
+//*****************************************************************************
+// Web Socket interface. Our front end UI is running leaflet js. It has an
+// open websocket to this backend. The backend has 3 threads:
+//
+// -------------
+// | Listening |
+// -------------
+//      |        
+//      | Conn recv, Spawn     ---------------
+//      |--------------------->| Recv Thread |
+//      |                      ---------------
+//      | (blocks incoming)         |
+//      |                           | Spawn         ----------------
+//      |                           |-------------->| Async Runner |
+//      |                           |               ----------------
+//      |                           |                       |
+//      |                           | Process req, Q-post   |
+//      |                           |---------------------->|
+//      |                           |                       | Q-get -> Send
+//      |                           |                       |----------------->
+//      |                           |    conn closed, kill  |
+//      |   die, client count -> 0  |---------------------->|
+//      |<--------------------------|
+//      |
+//      V        
+//
+// The listening thread replaces the main thread. It opens a TCP listening
+// socket. When an incoming connection is accepted it launches a receive thread
+// to handle input from the client. In ws.h we set MAX CLIENTS to 1 so when 
+// a client is connected, the listening thread will block all other incoming
+// connections till that one client is closed. The listneing thread logic is
+// wholey contained in the wsServer.
+//
+// The receive immediatly calls the registered call back "onopen" once
+// spawned. It creates an async_q and a single async_runner. These async 
+// objects are created to handle output from the backend to the front end 
+// client. The async queue takes a tuple (sv ID, WGS84 point, utc time in
+// seconds) as its q elements ,packages them, and sends them to the front end 
+// client. The receivers main purpose is to handle requests from the client. 
+// On input, the onmessage call back is called which processes the request and 
+// posts to the async Q ID, point, UTC time tuples to be sent to the client. 
+// When a client closes a session, the onclose call back is invoked which 
+// cleans the async resource. The recv thread then gracefully exits. Most the 
+// logic besides the onopen, onclose and onmessage are contained in wsServer.
 //*****************************************************************************
 
 static uint32_t path_q_size = 100;
@@ -742,36 +916,20 @@ static ws_cli_conn_t *ui_client = NULL;
 static async_runner_t path_runner;
 static async_q_t path_q;
 
+
 void consome_path(void* arg)
 {
-    WGS84_t point = *((WGS84_t*) arg);
-    char send_str[48];
-    snprintf(send_str, 100, "%15lf,%15lf", deg(point.lat), deg(point.lon));
+    PATH_t path = *((PATH_t*) arg);
+    WGS84_t w = path.p;
+    char send_str[WS_RESPONSE_MSG_SIZE];
+    snprintf(send_str, WS_RESPONSE_MSG_SIZE, "%d,%0.10lf,%0.10lf,%0.10lf", 
+        path.sv_id, 
+        deg(w.lat), 
+        deg(w.lon),
+        path.t
+    );
     LOG("INFO", "Sending: %s", send_str);
     ws_sendframe_txt(ui_client, send_str);
-}
-
-void post_path()
-{
-    PATH_t path[10];
-    path[0].p = ECEF((WGS84_t) {rad(38.0), rad(-105.0), 2000});
-    path[0].v = (ECEF_t) {0,0,0};
-    path[0].a = (ECEF_t) {0,0,0};
-    path[0].t = 0.0;
-    path[9].p = ECEF((WGS84_t) {rad(38.0), rad(-115.0), 2000});
-    path[9].v = (ECEF_t) {0,0,0};
-    path[9].a = (ECEF_t) {0,0,0};
-    path[9].t = 10.0;
-    path_gen(path, 10);
-
-    int i;
-    for(i = 0; i < 10; i++)
-    {
-        WGS84_t w = WGS84(path[i].p);
-        async_post(&path_q, &w);
-        sleep(1);
-    }
-    
 }
 
 void onopen(ws_cli_conn_t *client)
@@ -788,18 +946,8 @@ void onopen(ws_cli_conn_t *client)
     }
     ui_client = client;
 
-
-    async_q_create(&path_q, sizeof(WGS84_t), path_q_size);
+    async_q_create(&path_q, sizeof(PATH_t), path_q_size);
     async_launch_runners(&path_runner, 1, &path_q, consome_path);
-
-    post_path();
-
-    async_kill_runners(&path_runner);
-    aysnc_q_destroy(&path_q);
-
-    ws_close_client(client);
-    ui_client = NULL;
-
 }
 
 void onclose(ws_cli_conn_t *client)
@@ -808,6 +956,11 @@ void onclose(ws_cli_conn_t *client)
 	cli = ws_getaddress(client);
     port = ws_getport(client);
 	LOG("INFO", "WS Connection closed, addr: %s, port: %s", cli, port);
+
+    async_kill_runners(&path_runner);
+    aysnc_q_destroy(&path_q);
+
+    ui_client = NULL;
 }
 
 void onmessage(ws_cli_conn_t *client,
@@ -829,8 +982,8 @@ int main(void)
 {
 
     ws_socket(&(struct ws_server){
-		.host = "127.0.0.1",
-		.port = 6969,
+		.host = WS_SERVER_IP,
+		.port = WS_SERVER_PORT,
 		.thread_loop   = 0,
 		.timeout_ms    = 1000,
 		.evs.onopen    = &onopen,
