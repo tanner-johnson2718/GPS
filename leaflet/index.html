@@ -51,7 +51,7 @@
 		'Sat 1' : path
 	}
 
-	const layerControl = L.control.layers(baseLayers, overlays).addTo(map);
+	var layerControl = L.control.layers(baseLayers, overlays).addTo(map);
 
 	function onPressLatLon(event) {
 		if(event.key == "Enter") {

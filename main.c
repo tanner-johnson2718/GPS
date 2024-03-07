@@ -21,6 +21,7 @@
 
 #define ASYNC_TEST 0
 #define GEOCORD_TEST 0
+#define PATH_DB_TEST 0
 #define WS_SERVER_IP "127.0.0.1"
 #define WS_SERVER_PORT 6969
 #define WS_RESPONSE_MSG_SIZE 128
@@ -673,7 +674,8 @@ static void async_q_test()
 // SV Real time data and location prediction and regression. For each GPS sat
 // i.e. sv we keep only its most up to date location in WGS84 cordinates. We 
 // also keep its SV ID and a time for which that location was recorded in a 
-// floating value in UTC time.
+// floating value in UTC time. Finally we keep its calculated instantaneous
+// angluar velocity. This how we can predict its path.
 //
 // We provide two functions. 1) is the SV in some given bounds. This is so we
 // can determine which SVs we need to send the client data on. We also provide
@@ -684,8 +686,8 @@ static void async_q_test()
 
 typedef struct
 {   uint16_t sv_id;
-    WGS84_t p;
-    WGS84_t v;
+    WGS84_t p;    // rad
+    WGS84_t v;    // rad / s
     double  t;
 } PATH_t;
 
@@ -738,11 +740,18 @@ bool generate_path(uint16_t id,
     if(!is_sv_on_map(id, lat_min,lat_max,lon_min,lon_max) )
     {
         LOG("ERROR", "SV not on map");
+        return false;
     }
 
     if(path == NULL)
     {
         LOG("ERROR", "NULL path passed");
+        return false;
+    }
+
+    if(path_size < 2)
+    {
+        LOG("ERROR", "Path size must be greater than 1");
         return false;
     }
 
@@ -847,23 +856,113 @@ bool generate_path(uint16_t id,
         path_bd_second.lat = v.lat*lon_t_west;
     }
 
-    LOG("DEBUG", "");
-    LOG("DEBUG", "Path Boundaries for id=%d", id);
-    LOG("DEBUG", "lat_bd = [%0.2lf x %0.2lf]   lon_bd = [%0.2lf x %0.2lf]", lat_min, lat_max, lon_min, lon_max);
-    LOG("DEBUG", "P = [%0.2lf , %0.2lf]   V = [%0.2lf , %0.2lf]", p.lat, p.lon, v.lat, v.lon);
-    LOG("DEBUG", "lat_t_north = %0.2lf", lat_t_north);
-    LOG("DEBUG", "lat_t_south = %0.2lf", lat_t_south);
-    LOG("DEBUG", "lon_t_east = %0.2lf", lon_t_east);
-    LOG("DEBUG", "lon_t_west = %0.2lf", lon_t_west);
-    LOG("DEBUG", "");
+    #if PATH_DB_TEST
+        LOG("DEBUG", "");
+        LOG("DEBUG", "Path Boundaries for id=%d", id);
+        LOG("DEBUG", "lat_bd = [%0.2lf x %0.2lf]   lon_bd = [%0.2lf x %0.2lf]", deg(lat_min), deg(lat_max), deg(lon_min), deg(lon_max));
+        LOG("DEBUG", "P = [%0.2lf , %0.2lf]   V = [%0.2lf , %0.2lf]", deg(p.lat), deg(p.lon), deg(v.lat), deg(v.lon));
+        LOG("DEBUG", "BD_1 = [%0.2lf , %0.2lf]   BD_2 = [%0.2lf , %0.2lf]", deg(path_bd_first.lat), deg(path_bd_first.lon), deg(path_bd_second.lat), deg(path_bd_second.lon));
+        LOG("DEBUG", "lat_t_north = %0.2lf", lat_t_north);
+        LOG("DEBUG", "lat_t_south = %0.2lf", lat_t_south);
+        LOG("DEBUG", "lon_t_east = %0.2lf", lon_t_east);
+        LOG("DEBUG", "lon_t_west = %0.2lf", lon_t_west);
+        LOG("DEBUG", "");
+    #endif
 
+    //*************************************************************************
+    // We now have the boundary points where the projected path of the SV 
+    // intersects the boundary. We need to compute the distance between these
+    // points in each dir and divide by the number points in the passed path 
+    // buffer. This gives us the step size in each dir of the path points.
+    // Using the step size populate the buffer.
+    //*************************************************************************
+
+    double lat_step_size = fabs(path_bd_first.lat - path_bd_second.lat);
+    lat_step_size = lat_step_size / (((double)path_size) -1.0);
+
+    double lon_step_size = fabs(path_bd_first.lon - path_bd_second.lon);
+    lon_step_size = lon_step_size / (((double)path_size) -1.0);
+
+    double t_step_size = fabs(smallest - next_smallest);
+    t_step_size = t_step_size / (((double)path_size) -1.0);
+
+    if(smallest < 0.0)
+    {
+        path[0].p.lat = path_bd_first.lat;
+        path[0].p.lon = path_bd_first.lon;
+        path[0].p.alt = sv_locs[id].p.alt;
+        path[0].t = smallest;
+    }
+    else
+    {
+        path[0].p.lat = path_bd_second.lat;
+        path[0].p.lon = path_bd_second.lon;
+        path[0].p.alt = sv_locs[id].p.alt;
+        path[0].t = next_smallest;
+    }
+
+    if(sv_locs[id].v.lat < 0.0)
+    {
+        lat_step_size *= -1.0;
+    }
+
+    if(sv_locs[id].v.lon < 0.0)
+    {
+        lon_step_size *= -1.0;
+    }
+
+    uint16_t i;
+    for(i = 1; i < path_size; ++i)
+    {
+        path[i].p.lat = path[0].p.lat + (i*lat_step_size);
+        path[i].p.lon = path[0].p.lon + (i*lon_step_size);
+        path[i].t = path[0].t + (i*t_step_size);
+    }
+
+    return true;
 }
 
 // for now just put some random bs in there
 void pull_init_sv_locs()
 {
-    
+    uint16_t i;
+    for(i = 0; i < NUM_SVS; ++i)
+    {
+        sv_locs[i].p.lat = M_PI_2 * (((double) rand() / (double) RAND_MAX) - 1.0 );
+        sv_locs[i].p.lon = M_PI * (((double) rand() / (double) RAND_MAX) - 1.0);
+        sv_locs[i].p.alt = 0.0;
+
+        sv_locs[i].v.lat = (((double) rand() / (double) 0x7fffffff) - 1.0) / 10.0;
+        sv_locs[i].v.lon = (((double) rand() / (double) 0x7fffffff) - 1.0) / 10.0;
+
+        LOG("DEBUG", "Sat %d  p=%0.2lf, %0.2lf  v=%0.2lf,%0.2lf", 
+            deg(sv_locs[i].p.lat),
+            deg(sv_locs[i].p.lon),
+            deg(sv_locs[i].v.lat),
+            deg(sv_locs[i].v.lon));
+
+        sv_locs[i].t = 0.0;
+    }
 }
+
+#if PATH_DB_TEST
+void path_gen_test()
+{
+    uint16_t i;
+    PATH_t path[50];
+    for(i = 0; i < NUM_SVS; ++i)
+    {
+        generate_path(i, 
+                      rad(-50.0), 
+                      rad(50.0),
+                      rad(-120.0),
+                      rad(120.0),
+                      &path,
+                      50);
+
+    }
+}
+#endif
 
 //*****************************************************************************
 // Web Socket interface. Our front end UI is running leaflet js. It has an
@@ -980,6 +1079,10 @@ void onmessage(ws_cli_conn_t *client,
 
 int main(void)
 {
+
+    pull_init_sv_locs();
+
+    return 0;
 
     ws_socket(&(struct ws_server){
 		.host = WS_SERVER_IP,
