@@ -707,13 +707,13 @@ static bool is_sv_on_map(uint16_t id,
 
     if(lat_min < -M_PI_2 || lat_max > M_PI_2 || lat_max <= lat_min)
     {
-        LOG("ERROR", "lat range invalid");
+        LOG("ERROR", "lat range invalid: [%0.2lf,%0.2lf]", lat_min, lat_max);
         return false;
     }
 
     if(lon_min < -M_PI || lon_max > M_PI || lon_max <= lon_min)
     {
-        LOG("ERROR", "lon range invalid");
+        LOG("ERROR", "lon range invalid: [%0.2lf,%0.2lf]", lon_min, lon_max);
         return false;
     }
 
@@ -891,15 +891,17 @@ bool generate_path(uint16_t id,
         path[0].p.lat = path_bd_first.lat;
         path[0].p.lon = path_bd_first.lon;
         path[0].p.alt = sv_locs[id].p.alt;
-        path[0].t = smallest;
+        path[0].t = smallest + sv_locs[id].t;
     }
     else
     {
         path[0].p.lat = path_bd_second.lat;
         path[0].p.lon = path_bd_second.lon;
         path[0].p.alt = sv_locs[id].p.alt;
-        path[0].t = next_smallest;
+        path[0].t = next_smallest +  + sv_locs[id].t;
     }
+
+    path[0].sv_id = id;
 
     if(sv_locs[id].v.lat < 0.0)
     {
@@ -917,6 +919,7 @@ bool generate_path(uint16_t id,
         path[i].p.lat = path[0].p.lat + (i*lat_step_size);
         path[i].p.lon = path[0].p.lon + (i*lon_step_size);
         path[i].t = path[0].t + (i*t_step_size);
+        path[i].sv_id = id;
     }
 
     return true;
@@ -942,6 +945,8 @@ void pull_init_sv_locs()
             deg(sv_locs[i].v.lon));
 
         sv_locs[i].t = 0.0;
+
+        sv_locs[i].sv_id = i;
     }
 }
 
@@ -1070,9 +1075,49 @@ void onmessage(ws_cli_conn_t *client,
     port = ws_getport(client);
 	LOG("INFO", "I receive a message: %s (size: %" PRId64 ", type: %d), from: %s:%s",
 		msg, size, type, cli, port);
+
+    double lat_min, lat_max, lon_min, lon_max;
+    int parsed = sscanf(msg, "%lf,%lf,%lf,%lf", 
+        &lat_min,
+        &lat_max,
+        &lon_min,
+        &lon_max
+    );
+
+    lat_min = rad(lat_min);
+    lat_max = rad(lat_max);
+    lon_min = rad(lon_min);
+    lon_max = rad(lon_max);
+
+    if(parsed != 4)
+    {
+        LOG("ERROR", "Incoming message parse error");
+        return;
+    }
+
+    uint16_t i;
+    PATH_t path[2];
+    for(i = 0; i < NUM_SVS; ++i)
+    {
+        if(is_sv_on_map(i, lat_min, lat_max, lon_min, lon_max))
+        {
+            generate_path(i, 
+                lat_min, 
+                lat_max, 
+                lon_min, 
+                lon_max, 
+                path, 
+                2
+            );
+
+            async_post(&path_q, &path[0]);
+            async_post(&path_q, &sv_locs[i]);
+            async_post(&path_q, &path[1]);
+        }
+    }
+
 }
-
-
+ 
 //*****************************************************************************
 // Entry
 //*****************************************************************************
@@ -1081,8 +1126,6 @@ int main(void)
 {
 
     pull_init_sv_locs();
-
-    return 0;
 
     ws_socket(&(struct ws_server){
 		.host = WS_SERVER_IP,

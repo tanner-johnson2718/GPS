@@ -34,7 +34,8 @@
 	const port = 6969;
 	const base_layer = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
 	const attriburtion = '&copy; <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a>';
-	
+	var socket;
+
 	var tiles = L.tileLayer(base_layer, { maxZoom: 19, attribution: attriburtion });
 	var map = L.map('map', {
 		center: [LAT_INIT, LON_INIT],
@@ -42,55 +43,56 @@
 		layers: [tiles]
 	});
 
-	var path = L.polyline([], {color: "red"});
-
-	const baseLayers = {
+	var baseLayers = {
 		'Base Map': tiles
 	};
-	const overlays = {
-		'Sat 1' : path
+
+	var overlays = {};
+	var paths = [];
+	for(let i = 0; i < 30; ++i) {
+		paths.push(L.polyline([], {color: "red"}));
+		overlays[i.toString()] = paths[i];
 	}
 
 	var layerControl = L.control.layers(baseLayers, overlays).addTo(map);
 
-	function onPressLatLon(event) {
-		if(event.key == "Enter") {
-			var lat = document.getElementsByName("lat")[0].value;
-			var lon = document.getElementsByName("lon")[0].value;
-			map.setView([lat, lon], default_zoom, true);
-		}
-	}
-
 	function handleWSInput(event){
 		
-		tuple_str = event.data.split(",");
-		tuple_doubles = [Number(tuple_str[0]),Number(tuple_str[1])];
-		path.addLatLng(tuple_doubles);
+		tuples = event.data.split(",");
+
+		id = Number(tuples[0]);
+		lat = Number(tuples[1]);
+		lon = Number(tuples[2]);
+		time = tuples[3];
+		
+		if(paths[id].getLatLngs().length < 3) {
+			paths[id].addLatLng(L.latLng(lat, lon));
+			return;
+		}
+
+		if(paths[id].getLatLngs().length == 3) {
+			paths[id].setLatLngs([]);
+			paths[id].addLatLng(L.latLng(lat, lon));
+			return;
+		}	
+
 	}
 
-	function connectWS() {
-		try {
-			const socket = new WebSocket("ws://127.0.0.1:6969");
+	socket = new WebSocket("ws://127.0.0.1:6969");
+	socket.addEventListener("open", (event) => {
+		console.log(event);
+		sendBds();
+	});
+	socket.addEventListener("close", (event) => {
+		console.log(event);
+	});
+	socket.addEventListener("message", handleWSInput);
 
-			socket.addEventListener("open", (event) => {
-	  			console.log(event);
-			});
-
-			socket.addEventListener("close", (event) => {
-	  			console.log(event);
-			});
-
-			socket.addEventListener("message", handleWSInput);
-		}
-		catch (error){
-			console.error(error);
-		}
-	}
-
-	connectWS();
+	var south_west = L.latLng(-90.0, -180.0);
+	var north_east = L.latLng(90.0, 180.0);
+	map.setMaxBounds(L.latLngBounds(south_west, north_east));
 
 	
-	path.addTo(map);
 </script>
 </div>
 
